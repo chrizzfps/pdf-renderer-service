@@ -6,6 +6,8 @@ import { renderDocumentPdf } from "./render-core.mjs"
 const PORT = Number(process.env.PORT || 3000)
 const RENDERER_SECRET = (process.env.PDF_RENDERER_SECRET || "").trim()
 const MAX_BODY_BYTES = 1024 * 1024
+const jobs = new Map()
+const JOB_TTL_MS = 15 * 60 * 1000
 
 const sendJson = (response, statusCode, payload) => {
   response.writeHead(statusCode, {
@@ -82,6 +84,44 @@ const isSignedJob = (job) => {
   }
 }
 
+const createJobId = () => crypto.randomBytes(12).toString("hex")
+
+const cleanupJobs = () => {
+  const now = Date.now()
+  for (const [jobId, job] of jobs.entries()) {
+    if (now - job.createdAt > JOB_TTL_MS) {
+      jobs.delete(jobId)
+    }
+  }
+}
+
+const serializeJob = (jobId, job) => ({
+  id: jobId,
+  status: job.status,
+  error: job.error ?? null,
+  filename: job.filename,
+  createdAt: job.createdAt,
+  completedAt: job.completedAt ?? null,
+})
+
+const startRenderJob = (jobId, renderJob) => {
+  const jobState = jobs.get(jobId)
+  if (!jobState) return
+
+  renderDocumentPdf(renderJob)
+    .then((pdfBytes) => {
+      jobState.status = "completed"
+      jobState.pdfBytes = pdfBytes
+      jobState.completedAt = Date.now()
+    })
+    .catch((error) => {
+      console.error(error instanceof Error ? error.stack || error.message : String(error))
+      jobState.status = "failed"
+      jobState.error = error instanceof Error ? error.message : String(error)
+      jobState.completedAt = Date.now()
+    })
+}
+
 const server = http.createServer(async (request, response) => {
   if (request.method === "OPTIONS") {
     sendCorsPreflight(response)
@@ -95,17 +135,55 @@ const server = http.createServer(async (request, response) => {
     return
   }
 
-  if (pathname === "/render" && request.method !== "POST") {
+  const jobStatusMatch = pathname.match(/^\/jobs\/([^/]+)$/)
+  if (request.method === "GET" && jobStatusMatch) {
+    cleanupJobs()
+    const job = jobs.get(jobStatusMatch[1])
+    if (!job) {
+      sendJson(response, 404, { error: "Job not found" })
+      return
+    }
+
+    sendJson(response, 200, serializeJob(jobStatusMatch[1], job))
+    return
+  }
+
+  const jobPdfMatch = pathname.match(/^\/jobs\/([^/]+)\/pdf$/)
+  if (request.method === "GET" && jobPdfMatch) {
+    cleanupJobs()
+    const job = jobs.get(jobPdfMatch[1])
+    if (!job) {
+      sendJson(response, 404, { error: "Job not found" })
+      return
+    }
+
+    if (job.status !== "completed" || !job.pdfBytes) {
+      sendJson(response, 409, serializeJob(jobPdfMatch[1], job))
+      return
+    }
+
+    response.writeHead(200, {
+      "Content-Type": "application/pdf",
+      "Content-Length": job.pdfBytes.length,
+      "Content-Disposition": `attachment; filename="${job.filename}"`,
+      "Cache-Control": "no-store",
+      "Access-Control-Allow-Origin": process.env.PDF_RENDERER_CORS_ORIGIN || "https://app.fusiongg.com",
+    })
+    response.end(job.pdfBytes)
+    return
+  }
+
+  if ((pathname === "/render" || pathname === "/jobs") && request.method !== "POST") {
     sendJson(response, 405, {
       error: "Method not allowed",
       method: request.method,
       path: pathname,
-      hint: "The renderer expects POST /render. If this says GET, a proxy probably redirected the request.",
+      hint: "The renderer expects POST /render or POST /jobs.",
     })
     return
   }
 
-  if (pathname !== "/render") {
+  if (pathname !== "/render" && pathname !== "/jobs") {
     sendJson(response, 404, { error: "Not found", method: request.method, path: pathname })
     return
   }
@@ -117,8 +195,27 @@ const server = http.createServer(async (request, response) => {
       return
     }
 
-    const pdfBytes = await renderDocumentPdf(job)
+    if (pathname === "/jobs") {
+      cleanupJobs()
+      const jobId = createJobId()
+      const filename = `${(job.title || "documento").toString().replace(/[^a-z0-9._-]+/gi, "-") || "documento"}.pdf`
+      jobs.set(jobId, {
+        status: "queued",
+        filename,
+        createdAt: Date.now(),
+      })
 
+      setImmediate(() => {
+        const jobState = jobs.get(jobId)
+        if (jobState) jobState.status = "rendering"
+        startRenderJob(jobId, job)
+      })
+
+      sendJson(response, 202, serializeJob(jobId, jobs.get(jobId)))
+      return
+    }
+
+    const pdfBytes = await renderDocumentPdf(job)
     response.writeHead(200, {
       "Content-Type": "application/pdf",
       "Content-Length": pdfBytes.length,
