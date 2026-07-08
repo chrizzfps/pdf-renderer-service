@@ -56,8 +56,18 @@ const server = http.createServer(async (request, response) => {
     return
   }
 
-  if (request.method !== "POST" || pathname !== "/render") {
-    sendJson(response, 404, { error: "Not found", path: pathname })
+  if (pathname === "/render" && request.method !== "POST") {
+    sendJson(response, 405, {
+      error: "Method not allowed",
+      method: request.method,
+      path: pathname,
+      hint: "The renderer expects POST /render. If this says GET, a proxy probably redirected the request.",
+    })
+    return
+  }
+
+  if (pathname !== "/render") {
+    sendJson(response, 404, { error: "Not found", method: request.method, path: pathname })
     return
   }
 
