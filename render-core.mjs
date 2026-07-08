@@ -51,14 +51,16 @@ const addCaptureStyles = async (page) => {
 }
 
 const captureSections = async (page) => {
-  const sections = page.locator(
-    [
-      '[data-pdf-page="true"]',
-      '.snap-start',
-      '[style*="scroll-snap-align: start"]',
-      '[style*="scrollSnapAlign"]',
-    ].join(", "),
-  )
+  const selector = [
+    '[data-pdf-page="true"]',
+    '.snap-start',
+    '[style*="scroll-snap-align: start"]',
+    '[style*="scrollSnapAlign"]',
+  ].join(", ")
+
+  await page.waitForSelector(selector, { state: "attached", timeout: 60000 }).catch(() => undefined)
+
+  const sections = page.locator(selector)
   const count = await sections.count()
 
   if (count === 0) {
@@ -135,12 +137,45 @@ export const renderDocumentPdf = async (job) => {
     })
 
     page.setDefaultTimeout(60000)
+
+    const consoleMessages = []
+    const pageErrors = []
+
+    page.on("console", (message) => {
+      if (["error", "warning"].includes(message.type())) {
+        consoleMessages.push(`${message.type()}: ${message.text()}`)
+      }
+    })
+    page.on("pageerror", (error) => {
+      pageErrors.push(error.message)
+    })
+
     await page.goto(job.url, { waitUntil: "domcontentloaded", timeout: 60000 })
     await waitForPageAssets(page)
     await addCaptureStyles(page)
     await page.waitForTimeout(500)
 
-    const captures = await captureSections(page)
+    let captures
+    try {
+      captures = await captureSections(page)
+    } catch (error) {
+      const diagnostics = await page.evaluate(() => ({
+        url: window.location.href,
+        title: document.title,
+        bodyText: document.body.innerText.slice(0, 500),
+        htmlClass: document.documentElement.className,
+        bodyClass: document.body.className,
+        rootHtml: document.getElementById("root")?.innerHTML.slice(0, 1000) ?? null,
+      }))
+
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)} ` +
+          `Console: ${JSON.stringify(consoleMessages.slice(-20))} ` +
+          `PageErrors: ${JSON.stringify(pageErrors.slice(-20))} ` +
+          `Diagnostics: ${JSON.stringify(diagnostics)}`,
+      )
+    }
+
     return await buildPdfBytes(captures, job.title)
   } finally {
     await browser.close()
