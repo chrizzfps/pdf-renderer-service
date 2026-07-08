@@ -3,7 +3,7 @@ import process from "node:process"
 
 const result = spawnSync(
   process.execPath,
-  ["./node_modules/playwright/cli.js", "install", "--with-deps", "chromium"],
+  ["./node_modules/playwright/cli.js", "install", "chromium"],
   {
     stdio: "inherit",
     shell: process.platform === "win32",
