@@ -1,13 +1,15 @@
 import http from "node:http"
 import crypto from "node:crypto"
 import process from "node:process"
+import fs from "node:fs/promises"
+import path from "node:path"
 import { renderDocumentPdf } from "./render-core.mjs"
 
 const PORT = Number(process.env.PORT || 3000)
 const RENDERER_SECRET = (process.env.PDF_RENDERER_SECRET || "").trim()
 const MAX_BODY_BYTES = 1024 * 1024
-const jobs = new Map()
 const JOB_TTL_MS = 15 * 60 * 1000
+const JOBS_DIR = path.resolve(process.env.PDF_RENDERER_JOBS_DIR || "./storage/jobs")
 
 const sendJson = (response, statusCode, payload) => {
   response.writeHead(statusCode, {
@@ -86,13 +88,73 @@ const isSignedJob = (job) => {
 
 const createJobId = () => crypto.randomBytes(12).toString("hex")
 
-const cleanupJobs = () => {
-  const now = Date.now()
-  for (const [jobId, job] of jobs.entries()) {
-    if (now - job.createdAt > JOB_TTL_MS) {
-      jobs.delete(jobId)
-    }
+const ensureJobsDir = async () => {
+  await fs.mkdir(JOBS_DIR, { recursive: true })
+}
+
+const getJobJsonPath = (jobId) => path.join(JOBS_DIR, `${jobId}.json`)
+const getJobPdfPath = (jobId) => path.join(JOBS_DIR, `${jobId}.pdf`)
+
+const isValidJobId = (jobId) => /^[a-f0-9]{24}$/i.test(jobId)
+
+const readJobState = async (jobId) => {
+  if (!isValidJobId(jobId)) return null
+
+  try {
+    const raw = await fs.readFile(getJobJsonPath(jobId), "utf8")
+    return JSON.parse(raw)
+  } catch (error) {
+    if (error?.code === "ENOENT") return null
+    throw error
   }
+}
+
+const writeJobState = async (jobId, jobState) => {
+  await ensureJobsDir()
+  await fs.writeFile(getJobJsonPath(jobId), JSON.stringify(jobState), "utf8")
+}
+
+const updateJobState = async (jobId, updates) => {
+  const current = await readJobState(jobId)
+  if (!current) return null
+
+  const next = { ...current, ...updates }
+  await writeJobState(jobId, next)
+  return next
+}
+
+const cleanupJobs = async () => {
+  await ensureJobsDir()
+  const now = Date.now()
+  const entries = await fs.readdir(JOBS_DIR, { withFileTypes: true })
+
+  await Promise.all(entries.map(async (entry) => {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) return
+
+    const jobId = entry.name.replace(/\.json$/, "")
+    const job = await readJobState(jobId)
+    if (!job || now - job.createdAt <= JOB_TTL_MS) return
+
+    await Promise.all([
+      fs.rm(getJobJsonPath(jobId), { force: true }),
+      fs.rm(getJobPdfPath(jobId), { force: true }),
+    ])
+  }))
+}
+
+const recoverStaleRenderingJob = async (jobId, job) => {
+  if (!job) return null
+  if (job.status !== "rendering") return job
+
+  const isStale = Date.now() - (job.updatedAt || job.createdAt) > 2 * 60 * 1000
+  if (!isStale) return job
+
+  return await updateJobState(jobId, {
+    status: "failed",
+    error: "El proceso del renderer se interrumpio antes de terminar el PDF.",
+    completedAt: Date.now(),
+    updatedAt: Date.now(),
+  })
 }
 
 const serializeJob = (jobId, job) => ({
@@ -104,22 +166,56 @@ const serializeJob = (jobId, job) => ({
   completedAt: job.completedAt ?? null,
 })
 
-const startRenderJob = (jobId, renderJob) => {
-  const jobState = jobs.get(jobId)
+const startRenderJob = async (jobId, renderJob) => {
+  const jobState = await updateJobState(jobId, {
+    status: "rendering",
+    updatedAt: Date.now(),
+  })
   if (!jobState) return
 
-  renderDocumentPdf(renderJob)
-    .then((pdfBytes) => {
-      jobState.status = "completed"
-      jobState.pdfBytes = pdfBytes
-      jobState.completedAt = Date.now()
+  try {
+    const pdfBytes = await renderDocumentPdf(renderJob)
+    await fs.writeFile(getJobPdfPath(jobId), pdfBytes)
+    await updateJobState(jobId, {
+      status: "completed",
+      completedAt: Date.now(),
+      updatedAt: Date.now(),
     })
-    .catch((error) => {
-      console.error(error instanceof Error ? error.stack || error.message : String(error))
-      jobState.status = "failed"
-      jobState.error = error instanceof Error ? error.message : String(error)
-      jobState.completedAt = Date.now()
+  } catch (error) {
+    console.error(error instanceof Error ? error.stack || error.message : String(error))
+    await updateJobState(jobId, {
+      status: "failed",
+      error: error instanceof Error ? error.message : String(error),
+      completedAt: Date.now(),
+      updatedAt: Date.now(),
     })
+  }
+}
+
+const sendPdf = async (response, jobId, job) => {
+  let pdfBytes
+
+  try {
+    pdfBytes = await fs.readFile(getJobPdfPath(jobId))
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      sendJson(response, 409, {
+        ...serializeJob(jobId, job),
+        error: "PDF file not ready",
+      })
+      return
+    }
+    throw error
+  }
+
+  response.writeHead(200, {
+    "Content-Type": "application/pdf",
+    "Content-Length": pdfBytes.length,
+    "Content-Disposition": `attachment; filename="${job.filename}"`,
+    "Cache-Control": "no-store",
+    "Access-Control-Allow-Origin": process.env.PDF_RENDERER_CORS_ORIGIN || "https://app.fusiongg.com",
+  })
+  response.end(pdfBytes)
 }
 
 const server = http.createServer(async (request, response) => {
@@ -137,39 +233,34 @@ const server = http.createServer(async (request, response) => {
 
   const jobStatusMatch = pathname.match(/^\/jobs\/([^/]+)$/)
   if (request.method === "GET" && jobStatusMatch) {
-    cleanupJobs()
-    const job = jobs.get(jobStatusMatch[1])
+    await cleanupJobs()
+    const jobId = jobStatusMatch[1]
+    const job = await recoverStaleRenderingJob(jobId, await readJobState(jobId))
     if (!job) {
       sendJson(response, 404, { error: "Job not found" })
       return
     }
 
-    sendJson(response, 200, serializeJob(jobStatusMatch[1], job))
+    sendJson(response, 200, serializeJob(jobId, job))
     return
   }
 
   const jobPdfMatch = pathname.match(/^\/jobs\/([^/]+)\/pdf$/)
   if (request.method === "GET" && jobPdfMatch) {
-    cleanupJobs()
-    const job = jobs.get(jobPdfMatch[1])
+    await cleanupJobs()
+    const jobId = jobPdfMatch[1]
+    const job = await recoverStaleRenderingJob(jobId, await readJobState(jobId))
     if (!job) {
       sendJson(response, 404, { error: "Job not found" })
       return
     }
 
-    if (job.status !== "completed" || !job.pdfBytes) {
-      sendJson(response, 409, serializeJob(jobPdfMatch[1], job))
+    if (job.status !== "completed") {
+      sendJson(response, 409, serializeJob(jobId, job))
       return
     }
 
-    response.writeHead(200, {
-      "Content-Type": "application/pdf",
-      "Content-Length": job.pdfBytes.length,
-      "Content-Disposition": `attachment; filename="${job.filename}"`,
-      "Cache-Control": "no-store",
-      "Access-Control-Allow-Origin": process.env.PDF_RENDERER_CORS_ORIGIN || "https://app.fusiongg.com",
-    })
-    response.end(job.pdfBytes)
+    await sendPdf(response, jobId, job)
     return
   }
 
@@ -196,22 +287,24 @@ const server = http.createServer(async (request, response) => {
     }
 
     if (pathname === "/jobs") {
-      cleanupJobs()
+      await cleanupJobs()
       const jobId = createJobId()
       const filename = `${(job.title || "documento").toString().replace(/[^a-z0-9._-]+/gi, "-") || "documento"}.pdf`
-      jobs.set(jobId, {
+      const jobState = {
         status: "queued",
         filename,
         createdAt: Date.now(),
-      })
+        updatedAt: Date.now(),
+      }
+      await writeJobState(jobId, jobState)
 
       setImmediate(() => {
-        const jobState = jobs.get(jobId)
-        if (jobState) jobState.status = "rendering"
-        startRenderJob(jobId, job)
+        startRenderJob(jobId, job).catch((error) => {
+          console.error(error instanceof Error ? error.stack || error.message : String(error))
+        })
       })
 
-      sendJson(response, 202, serializeJob(jobId, jobs.get(jobId)))
+      sendJson(response, 202, serializeJob(jobId, jobState))
       return
     }
 
