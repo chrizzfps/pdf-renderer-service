@@ -49,13 +49,15 @@ const isAuthorized = (request) => {
 }
 
 const server = http.createServer(async (request, response) => {
-  if (request.method === "GET" && request.url === "/health") {
+  const pathname = new URL(request.url || "/", "http://localhost").pathname.replace(/\/+$/, "") || "/"
+
+  if (request.method === "GET" && pathname === "/health") {
     sendJson(response, 200, { status: "ok" })
     return
   }
 
-  if (request.method !== "POST" || request.url !== "/render") {
-    sendJson(response, 404, { error: "Not found" })
+  if (request.method !== "POST" || pathname !== "/render") {
+    sendJson(response, 404, { error: "Not found", path: pathname })
     return
   }
 
