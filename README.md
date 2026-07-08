@@ -28,6 +28,9 @@ Variables de entorno:
 ```env
 PDF_RENDERER_SECRET=usa-el-mismo-secreto-que-en-hostinger
 PORT=3000
+PLAYWRIGHT_BROWSERS_PATH=0
+PDF_RENDERER_VIEWPORT_WIDTH=1440
+PDF_RENDERER_VIEWPORT_HEIGHT=810
 ```
 
 ## Healthcheck
@@ -73,3 +76,6 @@ PDF_RENDERER_SECRET=usa-el-mismo-secreto-que-en-render
 PDF_RENDERER_TIMEOUT=120
 PDF_RENDERER_DEVICE_SCALE_FACTOR=1
 ```
+
+Si el hosting va justo de recursos, deja `1440x810`. Si responde bien, puedes subir
+a `1920x1080`.

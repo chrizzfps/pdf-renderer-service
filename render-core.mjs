@@ -3,8 +3,8 @@ import { PDFDocument } from "pdf-lib"
 
 process.env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH || "0"
 
-export const PAGE_WIDTH = 1920
-export const PAGE_HEIGHT = 1080
+export const PAGE_WIDTH = Number(process.env.PDF_RENDERER_VIEWPORT_WIDTH || 1440)
+export const PAGE_HEIGHT = Number(process.env.PDF_RENDERER_VIEWPORT_HEIGHT || 810)
 
 const waitForPageAssets = async (page) => {
   await page.waitForLoadState("networkidle", { timeout: 60000 }).catch(() => undefined)
