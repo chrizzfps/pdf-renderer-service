@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "install:browser": "playwright install chromium",
-    "render:install": "playwright install chromium"
+    "install:browser": "node install-browser.mjs",
+    "render:install": "node install-browser.mjs"
   },
   "dependencies": {
     "pdf-lib": "^1.17.1",

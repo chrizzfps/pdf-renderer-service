@@ -1,6 +1,7 @@
 import process from "node:process"
-import { chromium } from "playwright"
 import { PDFDocument } from "pdf-lib"
+
+process.env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH || "0"
 
 export const PAGE_WIDTH = 1920
 export const PAGE_HEIGHT = 1080
@@ -109,6 +110,7 @@ export const renderDocumentPdf = async (job) => {
     browserOptions.executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
   }
 
+  const { chromium } = await import("playwright")
   const browser = await chromium.launch(browserOptions)
 
   try {
