@@ -1,4 +1,5 @@
 import http from "node:http"
+import crypto from "node:crypto"
 import process from "node:process"
 import { renderDocumentPdf } from "./render-core.mjs"
 
@@ -10,8 +11,21 @@ const sendJson = (response, statusCode, payload) => {
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
+    "Access-Control-Allow-Origin": process.env.PDF_RENDERER_CORS_ORIGIN || "https://app.fusiongg.com",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-PDF-Renderer-Secret",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   })
   response.end(JSON.stringify(payload))
+}
+
+const sendCorsPreflight = (response) => {
+  response.writeHead(204, {
+    "Access-Control-Allow-Origin": process.env.PDF_RENDERER_CORS_ORIGIN || "https://app.fusiongg.com",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-PDF-Renderer-Secret",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Max-Age": "86400",
+  })
+  response.end()
 }
 
 const readJsonBody = (request) =>
@@ -48,7 +62,32 @@ const isAuthorized = (request) => {
   return bearerToken === RENDERER_SECRET || rendererSecret === RENDERER_SECRET
 }
 
+const isSignedJob = (job) => {
+  if (!RENDERER_SECRET) return true
+  if (!job?.signature || !job?.expires) return false
+  if (Number(job.expires) < Math.floor(Date.now() / 1000)) return false
+
+  const payload = [
+    job.url || "",
+    job.title || "",
+    String(job.deviceScaleFactor ?? 1),
+    String(job.expires),
+  ].join("|")
+  const expected = crypto.createHmac("sha256", RENDERER_SECRET).update(payload).digest("hex")
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(job.signature), Buffer.from(expected))
+  } catch {
+    return false
+  }
+}
+
 const server = http.createServer(async (request, response) => {
+  if (request.method === "OPTIONS") {
+    sendCorsPreflight(response)
+    return
+  }
+
   const pathname = new URL(request.url || "/", "http://localhost").pathname.replace(/\/+$/, "") || "/"
 
   if (request.method === "GET" && pathname === "/health") {
@@ -71,19 +110,20 @@ const server = http.createServer(async (request, response) => {
     return
   }
 
-  if (!isAuthorized(request)) {
-    sendJson(response, 401, { error: "Unauthorized" })
-    return
-  }
-
   try {
     const job = await readJsonBody(request)
+    if (!isAuthorized(request) && !isSignedJob(job)) {
+      sendJson(response, 401, { error: "Unauthorized" })
+      return
+    }
+
     const pdfBytes = await renderDocumentPdf(job)
 
     response.writeHead(200, {
       "Content-Type": "application/pdf",
       "Content-Length": pdfBytes.length,
       "Cache-Control": "no-store",
+      "Access-Control-Allow-Origin": process.env.PDF_RENDERER_CORS_ORIGIN || "https://app.fusiongg.com",
     })
     response.end(pdfBytes)
   } catch (error) {
