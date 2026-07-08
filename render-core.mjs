@@ -51,11 +51,25 @@ const addCaptureStyles = async (page) => {
 }
 
 const captureSections = async (page) => {
-  const sections = page.locator('[data-pdf-page="true"]')
+  const sections = page.locator(
+    [
+      '[data-pdf-page="true"]',
+      '.snap-start',
+      '[style*="scroll-snap-align: start"]',
+      '[style*="scrollSnapAlign"]',
+    ].join(", "),
+  )
   const count = await sections.count()
 
   if (count === 0) {
-    throw new Error("No printable document modules were found.")
+    const diagnostics = await page.evaluate(() => ({
+      url: window.location.href,
+      title: document.title,
+      bodyText: document.body.innerText.slice(0, 500),
+      htmlClass: document.documentElement.className,
+      bodyClass: document.body.className,
+    }))
+    throw new Error(`No printable document modules were found. Page diagnostics: ${JSON.stringify(diagnostics)}`)
   }
 
   const captures = []
