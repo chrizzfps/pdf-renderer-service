@@ -68,7 +68,48 @@ const addCaptureStyles = async (page) => {
   })
 }
 
-const captureSections = async (page) => {
+const getPageDiagnostics = async (page) => {
+  try {
+    if (page.isClosed()) {
+      return { closed: true }
+    }
+
+    return await page.evaluate(() => ({
+      url: window.location.href,
+      title: document.title,
+      bodyText: document.body.innerText.slice(0, 500),
+      htmlClass: document.documentElement.className,
+      bodyClass: document.body.className,
+      rootHtml: document.getElementById("root")?.innerHTML.slice(0, 1000) ?? null,
+    }))
+  } catch (error) {
+    return {
+      diagnosticsError: error instanceof Error ? error.message : String(error),
+      closed: page.isClosed(),
+    }
+  }
+}
+
+const createPdf = async (title) => {
+  const pdf = await PDFDocument.create()
+  pdf.setTitle(title || "Documento Fusion")
+  pdf.setCreator("Fusion PDF Renderer")
+  pdf.setProducer("Playwright + pdf-lib")
+  return pdf
+}
+
+const addCaptureToPdf = async (pdf, capture) => {
+  const image = await pdf.embedPng(capture)
+  const pdfPage = pdf.addPage([PAGE_WIDTH, PAGE_HEIGHT])
+  pdfPage.drawImage(image, {
+    x: 0,
+    y: 0,
+    width: PAGE_WIDTH,
+    height: PAGE_HEIGHT,
+  })
+}
+
+const captureSectionsToPdf = async (page, title) => {
   const selector = [
     '[data-pdf-page="true"]',
     '.snap-start',
@@ -82,17 +123,11 @@ const captureSections = async (page) => {
   const count = await sections.count()
 
   if (count === 0) {
-    const diagnostics = await page.evaluate(() => ({
-      url: window.location.href,
-      title: document.title,
-      bodyText: document.body.innerText.slice(0, 500),
-      htmlClass: document.documentElement.className,
-      bodyClass: document.body.className,
-    }))
+    const diagnostics = await getPageDiagnostics(page)
     throw new Error(`No printable document modules were found. Page diagnostics: ${JSON.stringify(diagnostics)}`)
   }
 
-  const captures = []
+  const pdf = await createPdf(title)
 
   for (let index = 0; index < count; index += 1) {
     const section = sections.nth(index)
@@ -102,33 +137,12 @@ const captureSections = async (page) => {
       element.scrollTop = 0
     })
 
-    captures.push(
-      await section.screenshot({
-        type: "png",
-        animations: "disabled",
-        timeout: 60000,
-      }),
-    )
-  }
-
-  return captures
-}
-
-const buildPdfBytes = async (captures, title) => {
-  const pdf = await PDFDocument.create()
-  pdf.setTitle(title || "Documento Fusion")
-  pdf.setCreator("Fusion PDF Renderer")
-  pdf.setProducer("Playwright + pdf-lib")
-
-  for (const capture of captures) {
-    const image = await pdf.embedPng(capture)
-    const page = pdf.addPage([PAGE_WIDTH, PAGE_HEIGHT])
-    page.drawImage(image, {
-      x: 0,
-      y: 0,
-      width: PAGE_WIDTH,
-      height: PAGE_HEIGHT,
+    const capture = await section.screenshot({
+      type: "png",
+      animations: "disabled",
+      timeout: 60000,
     })
+    await addCaptureToPdf(pdf, capture)
   }
 
   return Buffer.from(await pdf.save())
@@ -139,7 +153,20 @@ export const renderDocumentPdf = async (job) => {
     throw new Error("Missing document URL.")
   }
 
-  const browserOptions = { headless: true }
+  const browserOptions = {
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-background-timer-throttling",
+      "--disable-renderer-backgrounding",
+      "--disable-features=site-per-process",
+    ],
+  }
   if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
     browserOptions.executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
   }
@@ -160,6 +187,7 @@ export const renderDocumentPdf = async (job) => {
 
     const consoleMessages = []
     const pageErrors = []
+    const lifecycleEvents = []
 
     page.on("console", (message) => {
       if (["error", "warning"].includes(message.type())) {
@@ -169,34 +197,31 @@ export const renderDocumentPdf = async (job) => {
     page.on("pageerror", (error) => {
       pageErrors.push(error.message)
     })
+    page.on("crash", () => {
+      lifecycleEvents.push("page crashed")
+    })
+    page.on("close", () => {
+      lifecycleEvents.push("page closed")
+    })
 
     await page.goto(job.url, { waitUntil: "domcontentloaded", timeout: 60000 })
     await waitForPageAssets(page)
     await addCaptureStyles(page)
     await page.waitForTimeout(500)
 
-    let captures
     try {
-      captures = await captureSections(page)
+      return await captureSectionsToPdf(page, job.title)
     } catch (error) {
-      const diagnostics = await page.evaluate(() => ({
-        url: window.location.href,
-        title: document.title,
-        bodyText: document.body.innerText.slice(0, 500),
-        htmlClass: document.documentElement.className,
-        bodyClass: document.body.className,
-        rootHtml: document.getElementById("root")?.innerHTML.slice(0, 1000) ?? null,
-      }))
+      const diagnostics = await getPageDiagnostics(page)
 
       throw new Error(
         `${error instanceof Error ? error.message : String(error)} ` +
           `Console: ${JSON.stringify(consoleMessages.slice(-20))} ` +
           `PageErrors: ${JSON.stringify(pageErrors.slice(-20))} ` +
+          `Lifecycle: ${JSON.stringify(lifecycleEvents.slice(-20))} ` +
           `Diagnostics: ${JSON.stringify(diagnostics)}`,
       )
     }
-
-    return await buildPdfBytes(captures, job.title)
   } finally {
     await browser.close()
   }
