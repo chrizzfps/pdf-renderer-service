@@ -3,7 +3,7 @@ import process from "node:process"
 import { renderDocumentPdf } from "./render-core.mjs"
 
 const PORT = Number(process.env.PORT || 3000)
-const RENDERER_SECRET = process.env.PDF_RENDERER_SECRET || ""
+const RENDERER_SECRET = (process.env.PDF_RENDERER_SECRET || "").trim()
 const MAX_BODY_BYTES = 1024 * 1024
 
 const sendJson = (response, statusCode, payload) => {
@@ -42,7 +42,10 @@ const readJsonBody = (request) =>
 
 const isAuthorized = (request) => {
   if (!RENDERER_SECRET) return true
-  return request.headers.authorization === `Bearer ${RENDERER_SECRET}`
+  const bearerToken = request.headers.authorization?.replace(/^Bearer\s+/i, "").trim()
+  const rendererSecret = request.headers["x-pdf-renderer-secret"]?.trim()
+
+  return bearerToken === RENDERER_SECRET || rendererSecret === RENDERER_SECRET
 }
 
 const server = http.createServer(async (request, response) => {
