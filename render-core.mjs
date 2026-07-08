@@ -1,7 +1,25 @@
+import fs from "node:fs"
+import path from "node:path"
 import process from "node:process"
 import { PDFDocument } from "pdf-lib"
 
 process.env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH || "0"
+
+const makeChromiumExecutablesRunnable = (directory) => {
+  if (!fs.existsSync(directory)) return
+
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const fullPath = path.join(directory, entry.name)
+    if (entry.isDirectory()) {
+      makeChromiumExecutablesRunnable(fullPath)
+      continue
+    }
+
+    if (entry.name === "chrome-headless-shell" || entry.name === "chrome" || entry.name.endsWith(".sh")) {
+      fs.chmodSync(fullPath, 0o755)
+    }
+  }
+}
 
 export const PAGE_WIDTH = Number(process.env.PDF_RENDERER_VIEWPORT_WIDTH || 1440)
 export const PAGE_HEIGHT = Number(process.env.PDF_RENDERER_VIEWPORT_HEIGHT || 810)
@@ -125,6 +143,8 @@ export const renderDocumentPdf = async (job) => {
   if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
     browserOptions.executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
   }
+
+  makeChromiumExecutablesRunnable(path.join(process.cwd(), "node_modules", "playwright-core", ".local-browsers"))
 
   const { chromium } = await import("playwright")
   const browser = await chromium.launch(browserOptions)
